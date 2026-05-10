@@ -1,0 +1,560 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Gemma Synth Host — a short-lived GPU EC2 instance running Ollama with
+  gemma4:26b (MoE, 4B active) for local synthetic-data generation tasks.
+  Zero public ports, SSM-only access, encrypted EBS, S3 artifact bucket.
+
+# =============================================================================
+# METADATA
+# =============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Project }
+        Parameters: [ProjectName, Environment]
+      - Label: { default: Compute }
+        Parameters: [InstanceType, UseSpotInstance, RootVolumeSizeGB]
+      - Label: { default: Network (bring-your-own VPC) }
+        Parameters: [VpcId, SubnetId]
+      - Label: { default: Ollama }
+        Parameters: [OllamaModel, OllamaNumParallel, OllamaKeepAlive]
+      - Label: { default: Cost guardrails }
+        Parameters: [AutoShutdownHours]
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+  ProjectName:
+    Type: String
+    Default: gemma-synth
+    AllowedPattern: '^[a-z][a-z0-9-]{2,30}$'
+    Description: Short project name used for tagging and resource naming.
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name (affects tags and retention).
+
+  InstanceType:
+    Type: String
+    Default: g5.xlarge
+    AllowedValues:
+      - g5.xlarge       # 1x A10G 24GB, 4 vCPU, 16GB RAM   (~$1.0/hr OD)  recommended
+      - g5.2xlarge      # 1x A10G 24GB, 8 vCPU, 32GB RAM   (~$1.2/hr)    if CPU-heavy
+      - g6.xlarge       # 1x L4 24GB,   4 vCPU, 16GB RAM   (~$0.8/hr)    cheaper, decode slower
+      - g6e.xlarge      # 1x L40S 48GB, 4 vCPU, 32GB RAM   (~$1.9/hr)    BF16/FP8 headroom
+    Description: >
+      GPU instance type. g5.xlarge is the cheapest 24GB option and fits
+      gemma4:26b (Q4_K_M, ~17GB VRAM) with room for 32K context.
+
+  UseSpotInstance:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >
+      Use Spot for ~60% cost reduction. Synth jobs are embarrassingly
+      resumable (skip already-written JSONL rows) so Spot is low risk.
+
+  RootVolumeSizeGB:
+    Type: Number
+    Default: 100
+    MinValue: 60
+    MaxValue: 500
+    Description: >
+      EBS size in GB. Must hold OS (~20GB) + Ollama model cache (~25GB for
+      gemma4:26b) + staging output. 100GB is comfortable.
+
+  # ---------------------------------------------------------------------
+  # Networking: BYO VPC + Subnet.
+  # Using the default VPC is the easiest path; `deploy.sh` auto-detects
+  # it if these are not passed explicitly. Security does NOT depend on
+  # VPC isolation — the SG has zero inbound rules.
+  # ---------------------------------------------------------------------
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Existing VPC (default VPC is fine).
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: >
+      Subnet in the chosen VPC, in an AZ that offers the instance type.
+      Public subnet (MapPublicIpOnLaunch=true) is easiest.
+
+  # ---------------------------------------------------------------------
+  # Ollama runtime knobs
+  # ---------------------------------------------------------------------
+  OllamaModel:
+    Type: String
+    Default: 'gemma4:26b'
+    Description: Ollama model tag to pull on first boot.
+
+  OllamaNumParallel:
+    Type: Number
+    Default: 4
+    MinValue: 1
+    MaxValue: 16
+    Description: >
+      OLLAMA_NUM_PARALLEL. Ollama serializes requests but allows N-way
+      scheduling; 4 is the sweet spot on 24GB before VRAM pressure hurts.
+
+  OllamaKeepAlive:
+    Type: String
+    Default: '24h'
+    Description: >
+      OLLAMA_KEEP_ALIVE. Keeps model hot in VRAM between batches so first
+      request after idle doesn't pay 30s reload.
+
+  AutoShutdownHours:
+    Type: Number
+    Default: 1
+    MinValue: 0
+    MaxValue: 72
+    Description: >
+      On-instance cron stops the instance after N idle hours (0 disables).
+      Idle = GPU util <5% AND GPU memory <1GB AND no active SSM sessions.
+
+  # Amazon Linux 2023 is not used here because nvidia-container-toolkit and
+  # CUDA driver installs are more painful on AL2023 than Ubuntu 22.04.
+  # We use the NVIDIA GPU-Optimized AMI (Marketplace, free) published by
+  # NVIDIA — driver + CUDA + docker pre-installed, Ubuntu 22.04 base.
+  # Alternative: AWS Deep Learning Base GPU AMI (bigger but same idea).
+  LatestNvidiaAmiSsmParam:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/deeplearning/ami/x86_64/base-oss-nvidia-driver-gpu-ubuntu-22.04/latest/ami-id
+    Description: >
+      Public SSM parameter pointing to the latest AWS Deep Learning Base GPU
+      AMI (Ubuntu 22.04, NVIDIA driver pre-installed, no PyTorch — minimal
+      image, ideal for Ollama-only workloads).
+
+# =============================================================================
+# CONDITIONS
+# =============================================================================
+Conditions:
+  UseSpot: !Equals [!Ref UseSpotInstance, 'true']
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # Security Group: ZERO inbound. Egress scoped to what we actually need:
+  #   - 443/TCP: Ollama model pulls (ollama.com, HF Hub), SSM, S3, apt mirrors
+  #   - 80/TCP:  apt mirror redirects
+  #   - 53/UDP/TCP: DNS
+  #   - 123/UDP: NTP
+  # Access to Ollama's 11434 port is ONLY via SSM port forwarding.
+  # ---------------------------------------------------------------------------
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub ${ProjectName} ollama host - zero inbound, all access via SSM
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS outbound (Ollama registry, SSM, S3, apt)
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP outbound (apt mirrors)
+        - IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: 0.0.0.0/0
+          Description: DNS (UDP)
+        - IpProtocol: tcp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: 0.0.0.0/0
+          Description: DNS (TCP fallback)
+        - IpProtocol: udp
+          FromPort: 123
+          ToPort: 123
+          CidrIp: 0.0.0.0/0
+          Description: NTP
+      Tags:
+        - { Key: Name,      Value: !Sub '${ProjectName}-sg' }
+        - { Key: NoIngress, Value: 'true' }
+
+  # ---------------------------------------------------------------------------
+  # S3 bucket for synthesised JSONL / raw logs.
+  # Retain on stack delete — synth results may be expensive to reproduce.
+  # ---------------------------------------------------------------------------
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub ${ProjectName}-${Environment}-artifacts-${AWS::AccountId}-${AWS::Region}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration: { Status: Enabled }
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      LifecycleConfiguration:
+        Rules:
+          - Id: AbortIncompleteMultipartUpload
+            Status: Enabled
+            AbortIncompleteMultipartUpload: { DaysAfterInitiation: 7 }
+      Tags:
+        - { Key: Project,     Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  ArtifactBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt ArtifactBucket.Arn
+              - !Sub ${ArtifactBucket.Arn}/*
+            Condition:
+              Bool: { aws:SecureTransport: 'false' }
+
+  # ---------------------------------------------------------------------------
+  # IAM: instance role with least-privilege scope.
+  #   - SSM Session Manager (connect + port forward)
+  #   - CloudWatch Agent metrics
+  #   - Read/write on the artifact bucket
+  # ---------------------------------------------------------------------------
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${Environment}-instance-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: ArtifactBucketAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub ${ArtifactBucket.Arn}/*
+      Tags:
+        - { Key: Project,     Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub ${ProjectName}-${Environment}-instance-profile
+      Roles: [!Ref InstanceRole]
+
+  # ---------------------------------------------------------------------------
+  # Launch template: IMDSv2 required, encrypted EBS, Ubuntu + NVIDIA driver.
+  # UserData does the whole install (Ollama + model pull + warm-up + auto-shutdown).
+  # ---------------------------------------------------------------------------
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub ${ProjectName}-${Environment}-lt
+      LaunchTemplateData:
+        ImageId: !Ref LatestNvidiaAmiSsmParam
+        InstanceType: !Ref InstanceType
+        InstanceInitiatedShutdownBehavior: stop
+        IamInstanceProfile: { Arn: !GetAtt InstanceProfile.Arn }
+        MetadataOptions:
+          HttpTokens: required
+          HttpEndpoint: enabled
+          HttpPutResponseHopLimit: 2
+        BlockDeviceMappings:
+          - DeviceName: /dev/sda1
+            Ebs:
+              VolumeSize: !Ref RootVolumeSizeGB
+              VolumeType: gp3
+              Iops: 3000
+              Throughput: 250
+              Encrypted: true
+              DeleteOnTermination: true
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            AssociatePublicIpAddress: true
+            Groups: [!Ref InstanceSecurityGroup]
+            SubnetId: !Ref SubnetId
+        InstanceMarketOptions: !If
+          - UseSpot
+          - MarketType: spot
+            SpotOptions:
+              SpotInstanceType: one-time
+              InstanceInterruptionBehavior: stop
+          - !Ref AWS::NoValue
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - { Key: Name,         Value: !Sub '${ProjectName}-${Environment}-host' }
+              - { Key: Project,      Value: !Ref ProjectName }
+              - { Key: Environment,  Value: !Ref Environment }
+              - { Key: AutoShutdown, Value: !Ref AutoShutdownHours }
+          - ResourceType: volume
+            Tags:
+              - { Key: Name, Value: !Sub '${ProjectName}-${Environment}-root' }
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            # =============================================================
+            # Gemma Synth Host bootstrap
+            # Steps: CW agent → Ollama install → model pull → warm-up →
+            #        auto-shutdown cron → ready marker.
+            # All steps are idempotent; safe to re-run.
+            # =============================================================
+            set -euo pipefail
+            exec > >(tee -a /var/log/user-data.log) 2>&1
+
+            echo "=== ${ProjectName} bootstrap: $(date -u) ==="
+
+            # Wait for NVIDIA driver to be actually usable.
+            for i in $(seq 1 30); do
+              if nvidia-smi >/dev/null 2>&1; then
+                echo "nvidia-smi OK after ${!i} attempts"
+                break
+              fi
+              sleep 2
+            done
+
+            # Project-scoped env vars for every login shell.
+            cat >/etc/profile.d/project.sh <<EOF
+            export ARTIFACT_BUCKET="${ArtifactBucket}"
+            export PROJECT_NAME="${ProjectName}"
+            export PROJECT_ENV="${Environment}"
+            export AWS_DEFAULT_REGION="${AWS::Region}"
+            EOF
+            chmod 0644 /etc/profile.d/project.sh
+
+            # CloudWatch agent — GPU + basic host metrics.
+            if [ -x /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl ]; then
+              cat >/opt/aws/amazon-cloudwatch-agent/etc/config.json <<'EOF'
+            {
+              "metrics": {
+                "namespace": "GemmaSynth",
+                "metrics_collected": {
+                  "mem":  { "measurement": ["mem_used_percent"] },
+                  "disk": { "measurement": ["used_percent"], "resources": ["/"] },
+                  "nvidia_gpu": {
+                    "measurement": [
+                      "utilization_gpu", "utilization_memory",
+                      "memory_used", "memory_total", "temperature_gpu"
+                    ]
+                  }
+                },
+                "append_dimensions": { "InstanceId": "${!aws:InstanceId}" }
+              },
+              "logs": {
+                "logs_collected": {
+                  "files": {
+                    "collect_list": [
+                      { "file_path": "/var/log/user-data.log",
+                        "log_group_name": "/${ProjectName}/${Environment}/user-data",
+                        "log_stream_name": "{instance_id}" },
+                      { "file_path": "/var/log/ollama.log",
+                        "log_group_name": "/${ProjectName}/${Environment}/ollama",
+                        "log_stream_name": "{instance_id}" }
+                    ]
+                  }
+                }
+              }
+            }
+            EOF
+              /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+                -a fetch-config -m ec2 -s \
+                -c file:/opt/aws/amazon-cloudwatch-agent/etc/config.json || true
+            fi
+
+            # --- Install Ollama ------------------------------------------
+            if ! command -v ollama >/dev/null 2>&1; then
+              echo "--- installing ollama ---"
+              curl -fsSL https://ollama.com/install.sh | sh
+            fi
+
+            # systemd override: bind to loopback only, tune for batch synth.
+            # OLLAMA_HOST=127.0.0.1 means the 11434 port is NEVER reachable
+            # from the network, even inside the VPC. Access is ONLY via SSM
+            # port forwarding, which tunnels to the loopback interface.
+            mkdir -p /etc/systemd/system/ollama.service.d
+            cat >/etc/systemd/system/ollama.service.d/override.conf <<EOF
+            [Service]
+            Environment="OLLAMA_HOST=127.0.0.1:11434"
+            Environment="OLLAMA_KEEP_ALIVE=${OllamaKeepAlive}"
+            Environment="OLLAMA_NUM_PARALLEL=${OllamaNumParallel}"
+            Environment="OLLAMA_MAX_LOADED_MODELS=1"
+            # Redirect stdout/stderr to a real file so CloudWatch agent can ship it.
+            StandardOutput=append:/var/log/ollama.log
+            StandardError=append:/var/log/ollama.log
+            EOF
+            touch /var/log/ollama.log
+            chown ollama:ollama /var/log/ollama.log 2>/dev/null || true
+
+            systemctl daemon-reload
+            systemctl enable ollama
+            systemctl restart ollama
+
+            # Wait for Ollama HTTP to respond.
+            for i in $(seq 1 60); do
+              if curl -fs http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+                echo "ollama API up after ${!i}s"
+                break
+              fi
+              sleep 1
+            done
+
+            # --- Pull model as the ollama user --------------------------
+            # `ollama pull` as root crashes with "$HOME is not defined" because
+            # Ollama CLI reads config from $HOME/.ollama. Run it under the
+            # `ollama` service user whose home is /usr/share/ollama. Models
+            # land in /usr/share/ollama/.ollama/models/ where the daemon
+            # (also running as `ollama`) can read them.
+            #
+            # Known Ollama issue (~0.23.x): in non-TTY contexts with stdout
+            # piped into tee/journald, the pull client hangs at the final
+            # verify step after blobs land on disk — epoll_pwait loops, the
+            # client never sees the server's "done" signal, manifest never
+            # registers. Workaround: bound the first pull with a timeout,
+            # then issue pull a second time. If blobs already exist on disk
+            # the second pull returns within seconds and registers the
+            # manifest, so `ollama list` / /api/tags finally see the model.
+            echo "--- pulling ${OllamaModel} (first pass, bounded) ---"
+            timeout --preserve-status 900 \
+              sudo -u ollama -H ollama pull '${OllamaModel}' || true
+
+            echo "--- pulling ${OllamaModel} (second pass, registers manifest) ---"
+            for attempt in 1 2 3; do
+              if sudo -u ollama -H ollama pull '${OllamaModel}'; then
+                break
+              fi
+              echo "pull attempt ${!attempt} failed, retrying in 10s..."
+              sleep 10
+            done
+
+            # Verify the daemon actually sees the model before marking ready.
+            if curl -fs http://127.0.0.1:11434/api/tags | grep -q '"${OllamaModel}"'; then
+              touch /var/lib/cloud/instance/ollama-ready
+              echo "=== model ready: ${OllamaModel} ==="
+            else
+              echo "ERROR: model not visible via /api/tags; not marking ready"
+            fi
+
+            # Warm-up: forces model into VRAM so first user request is fast.
+            # Gemma 4 ships with thinking mode ON by default — we explicitly
+            # set "think": false here so the warm-up doesn't stall for tens of
+            # seconds emitting reasoning tokens. Client code should do the
+            # same for synth workloads (see README).
+            echo "--- warming up ---"
+            curl -fs http://127.0.0.1:11434/api/chat -d '{
+              "model": "${OllamaModel}",
+              "messages": [{"role":"user","content":"Reply: ready."}],
+              "think": false,
+              "stream": false,
+              "options": { "num_predict": 8 }
+            }' >/var/log/ollama-warmup.json || true
+
+            # --- Layer 1 auto-shutdown cron ------------------------------
+            if [ "${AutoShutdownHours}" -gt 0 ]; then
+              cat >/usr/local/bin/auto-shutdown-check.sh <<'SHUTDOWN'
+            #!/bin/bash
+            # Runs every 15 min. Idle = GPU util <5% AND GPU mem <1GB AND no SSM sessions.
+            set -u
+            STATE=/var/run/idle-since
+            THRESHOLD_HOURS=__HOURS__
+
+            GPU_UTIL=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1 || echo 0)
+            GPU_UTIL=${!GPU_UTIL// /}
+            GPU_MEM=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1 || echo 0)
+            GPU_MEM=${!GPU_MEM// /}
+            SSM_SESSIONS=$(pgrep -c -f "ssm-session-worker" 2>/dev/null || echo 0)
+
+            if [ "${!GPU_UTIL:-0}" -lt 5 ] && [ "${!GPU_MEM:-0}" -lt 1024 ] && [ "${!SSM_SESSIONS:-0}" -eq 0 ]; then
+              [ -f "$STATE" ] || date +%s > "$STATE"
+              IDLE_HOURS=$(( ($(date +%s) - $(cat "$STATE")) / 3600 ))
+              logger -t auto-shutdown "idle ${!IDLE_HOURS}h (gpu=${!GPU_UTIL}% mem=${!GPU_MEM}MB ssm=${!SSM_SESSIONS})"
+              if [ "$IDLE_HOURS" -ge "$THRESHOLD_HOURS" ]; then
+                logger -t auto-shutdown "threshold reached, stopping in 5 min"
+                shutdown -h +5 "Auto-shutdown after ${!IDLE_HOURS} idle hours"
+              fi
+            else
+              rm -f "$STATE"
+              logger -t auto-shutdown "active (gpu=${!GPU_UTIL}% mem=${!GPU_MEM}MB ssm=${!SSM_SESSIONS})"
+            fi
+            SHUTDOWN
+              sed -i "s/__HOURS__/${AutoShutdownHours}/" /usr/local/bin/auto-shutdown-check.sh
+              chmod +x /usr/local/bin/auto-shutdown-check.sh
+              echo "*/15 * * * * root /usr/local/bin/auto-shutdown-check.sh" >/etc/cron.d/auto-shutdown
+            fi
+
+            # Ready marker already written above (right after model pull).
+            echo "=== Bootstrap done: $(date -u) ==="
+            echo "=== Next: run scripts/tunnel.sh from your Mac ==="
+
+  # ---------------------------------------------------------------------------
+  # The instance itself.
+  # ---------------------------------------------------------------------------
+  OllamaInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      Tags:
+        - { Key: Name,        Value: !Sub '${ProjectName}-${Environment}-host' }
+        - { Key: Project,     Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+  InstanceId:
+    Description: EC2 instance ID (used by scripts/tunnel.sh and scripts/ssm-shell.sh).
+    Value: !Ref OllamaInstance
+    Export: { Name: !Sub '${AWS::StackName}-InstanceId' }
+
+  ArtifactBucketName:
+    Description: S3 bucket for synth JSONL artifacts.
+    Value: !Ref ArtifactBucket
+    Export: { Name: !Sub '${AWS::StackName}-ArtifactBucket' }
+
+  OllamaModel:
+    Description: Model tag pulled at boot (available via 11434 once ready).
+    Value: !Ref OllamaModel
+
+  OllamaEndpointHint:
+    Description: How to reach Ollama once tunneled.
+    Value: http://localhost:11434
+
+  TunnelCommand:
+    Description: Copy-paste command to start the SSM port-forward tunnel.
+    Value: !Sub
+      - 'aws ssm start-session --target ${InstId} --region ${AWS::Region} --document-name AWS-StartPortForwardingSession --parameters ''{"portNumber":["11434"],"localPortNumber":["11434"]}'''
+      - InstId: !Ref OllamaInstance
