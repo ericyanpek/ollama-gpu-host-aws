@@ -1,21 +1,22 @@
 #!/usr/bin/env bash
-# deploy.sh — Create or update the Gemma Synth Host stack.
+# deploy.sh — Create or update the Ollama GPU Host stack.
 #
 # Usage:
-#   ./scripts/deploy.sh                          # defaults: us-east-1, g5.xlarge, on-demand
+#   ./scripts/deploy.sh                          # defaults: us-east-1, g5.xlarge, on-demand, gemma4:26b
 #   USE_SPOT=true ./scripts/deploy.sh            # Spot (~60% cheaper)
 #   AWS_REGION=us-west-2 ./scripts/deploy.sh     # different region
 #   INSTANCE_TYPE=g6e.xlarge ./scripts/deploy.sh # 48GB L40S
+#   OLLAMA_MODEL=llama3.1:8b ./scripts/deploy.sh # different model
 #
 # Env vars:
-#   STACK_NAME          (default: gemma-synth-dev)
+#   STACK_NAME          (default: ollama-host-dev)
 #   AWS_REGION          (default: us-east-1)
-#   PROJECT_NAME        (default: gemma-synth)
+#   PROJECT_NAME        (default: ollama-host)
 #   ENVIRONMENT         (default: dev)
 #   INSTANCE_TYPE       (default: g5.xlarge)
 #   USE_SPOT            (default: false)
 #   ROOT_VOLUME_GB      (default: 100)
-#   OLLAMA_MODEL        (default: gemma4:26b)
+#   OLLAMA_MODEL        (default: gemma4:26b — any ollama.com/library tag works)
 #   OLLAMA_NUM_PARALLEL (default: 4)
 #   OLLAMA_KEEP_ALIVE   (default: 24h)
 #   AUTO_SHUTDOWN_HOURS (default: 1)
@@ -24,9 +25,9 @@
 
 set -euo pipefail
 
-STACK_NAME="${STACK_NAME:-gemma-synth-dev}"
+STACK_NAME="${STACK_NAME:-ollama-host-dev}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
-PROJECT_NAME="${PROJECT_NAME:-gemma-synth}"
+PROJECT_NAME="${PROJECT_NAME:-ollama-host}"
 ENVIRONMENT="${ENVIRONMENT:-dev}"
 INSTANCE_TYPE="${INSTANCE_TYPE:-g5.xlarge}"
 USE_SPOT="${USE_SPOT:-false}"
@@ -90,7 +91,7 @@ if [ -z "$SUBNET_ID" ]; then
   echo "Auto-detected subnet: $SUBNET_ID"
 fi
 
-echo "=== Gemma Synth Host deploy ==="
+echo "=== Ollama GPU Host deploy ==="
 echo "Stack:         $STACK_NAME"
 echo "Region:        $AWS_REGION"
 echo "VPC / Subnet:  $VPC_ID / $SUBNET_ID"

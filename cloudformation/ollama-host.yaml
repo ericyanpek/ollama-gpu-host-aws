@@ -1,8 +1,10 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  Gemma Synth Host — a short-lived GPU EC2 instance running Ollama with
-  gemma4:26b (MoE, 4B active) for local synthetic-data generation tasks.
-  Zero public ports, SSM-only access, encrypted EBS, S3 artifact bucket.
+  Ollama GPU Host — a short-lived GPU EC2 instance running Ollama to serve
+  any Ollama-compatible model for local inference, data synthesis, or
+  batch jobs. Default model: gemma4:26b (validated). Override via the
+  OllamaModel parameter. Zero public ports, SSM-only access, encrypted
+  EBS, S3 artifact bucket.
 
 # =============================================================================
 # METADATA
@@ -27,7 +29,7 @@ Metadata:
 Parameters:
   ProjectName:
     Type: String
-    Default: gemma-synth
+    Default: ollama-host
     AllowedPattern: '^[a-z][a-z0-9-]{2,30}$'
     Description: Short project name used for tagging and resource naming.
 
@@ -46,8 +48,10 @@ Parameters:
       - g6.xlarge       # 1x L4 24GB,   4 vCPU, 16GB RAM   (~$0.8/hr)    cheaper, decode slower
       - g6e.xlarge      # 1x L40S 48GB, 4 vCPU, 32GB RAM   (~$1.9/hr)    BF16/FP8 headroom
     Description: >
-      GPU instance type. g5.xlarge is the cheapest 24GB option and fits
-      gemma4:26b (Q4_K_M, ~17GB VRAM) with room for 32K context.
+      GPU instance type. g5.xlarge is the cheapest 24GB option and is
+      validated with gemma4:26b (Q4_K_M, ~17GB VRAM) plus 32K context.
+      For 13B-class models 24GB is plenty. For 70B-class dense models
+      step up to g6e.xlarge (48GB L40S) or use a quant that fits.
 
   UseSpotInstance:
     Type: String
@@ -63,8 +67,9 @@ Parameters:
     MinValue: 60
     MaxValue: 500
     Description: >
-      EBS size in GB. Must hold OS (~20GB) + Ollama model cache (~25GB for
-      gemma4:26b) + staging output. 100GB is comfortable.
+      EBS size in GB. Must hold OS (~20GB) + Ollama model cache (size varies
+      per model; gemma4:26b is ~17GB, llama3.1:70b-q4 ~40GB) + staging output.
+      100GB is comfortable for one mid-size model; raise for 70B+ or multi-model.
 
   # ---------------------------------------------------------------------
   # Networking: BYO VPC + Subnet.
@@ -88,7 +93,11 @@ Parameters:
   OllamaModel:
     Type: String
     Default: 'gemma4:26b'
-    Description: Ollama model tag to pull on first boot.
+    Description: >
+      Ollama model tag to pull on first boot. Any tag from
+      https://ollama.com/library works (e.g. gemma4:26b, llama3.1:8b,
+      qwen2.5:14b, mistral-nemo:12b). Pick one that fits your
+      InstanceType's VRAM minus ~2GB overhead.
 
   OllamaNumParallel:
     Type: Number
@@ -326,7 +335,7 @@ Resources:
           Fn::Base64: !Sub |
             #!/bin/bash
             # =============================================================
-            # Gemma Synth Host bootstrap
+            # Ollama GPU Host bootstrap
             # Steps: CW agent → Ollama install → model pull → warm-up →
             #        auto-shutdown cron → ready marker.
             # All steps are idempotent; safe to re-run.
@@ -359,7 +368,7 @@ Resources:
               cat >/opt/aws/amazon-cloudwatch-agent/etc/config.json <<'EOF'
             {
               "metrics": {
-                "namespace": "GemmaSynth",
+                "namespace": "OllamaHost",
                 "metrics_collected": {
                   "mem":  { "measurement": ["mem_used_percent"] },
                   "disk": { "measurement": ["used_percent"], "resources": ["/"] },
@@ -467,10 +476,10 @@ Resources:
             fi
 
             # Warm-up: forces model into VRAM so first user request is fast.
-            # Gemma 4 ships with thinking mode ON by default — we explicitly
-            # set "think": false here so the warm-up doesn't stall for tens of
-            # seconds emitting reasoning tokens. Client code should do the
-            # same for synth workloads (see README).
+            # Some models ship with thinking/reasoning mode ON by default
+            # (e.g. Gemma 4). `"think": false` is honored by Ollama's
+            # /api/chat and is a no-op for models without a thinking mode,
+            # so it's safe to send unconditionally.
             echo "--- warming up ---"
             curl -fs http://127.0.0.1:11434/api/chat -d '{
               "model": "${OllamaModel}",

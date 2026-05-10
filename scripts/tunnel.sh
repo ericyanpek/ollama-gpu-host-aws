@@ -6,7 +6,7 @@
 
 set -euo pipefail
 
-STACK_NAME="${STACK_NAME:-gemma-synth-dev}"
+STACK_NAME="${STACK_NAME:-ollama-host-dev}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 LOCAL_PORT="${LOCAL_PORT:-11434}"
 

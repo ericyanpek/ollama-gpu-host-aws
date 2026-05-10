@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# destroy.sh — Tear down the Gemma Synth Host stack.
+# destroy.sh — Tear down the Ollama GPU Host stack.
 # The artifact S3 bucket is Retain — if you want to wipe it too, do it by hand.
 
 set -euo pipefail
 
-STACK_NAME="${STACK_NAME:-gemma-synth-dev}"
+STACK_NAME="${STACK_NAME:-ollama-host-dev}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 
 echo "=== Destroying stack: $STACK_NAME ($AWS_REGION) ==="

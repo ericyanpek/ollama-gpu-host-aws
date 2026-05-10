@@ -1,167 +1,167 @@
-# Gemma Synth Host
+# Ollama GPU Host on AWS
 
-EC2 + Ollama 托管 **Gemma 4 26B-A4B**,用于数据合成等旁路任务。
+一个通用的、短期运行的 GPU EC2 + Ollama 栈,用来托管任意 Ollama 兼容模型。
+零公网端口、SSM 访问、加密 EBS、可一键销毁,便于按需起停。
 
-和主微调项目 [`llm-fine-tune-research`](../llm-fine-tune-research) 解耦——不共享
-stack、不共享代码、不共享 IAM/S3 资源。只共享一份设计哲学:零公网端口、SSM 访问、
-加密 EBS、可一键销毁。
+> 历史原因,仓库文件夹仍叫 `gemma-synth-host/`——因为最初是为 Gemma 4 数据合成
+> 任务搭的。stack / project / AMI 等内部命名已经改成中性名(`ollama-host`),
+> 想换模型改一个 env var 即可。
 
 ## 适用场景
 
-- 用本地已验证的 Gemma 4 26B(Q4_K_M, 17 GB)批量生成训练 / 偏好数据
-- 短期(几小时到一两天)任务,跑完就销毁
-- 单 GPU 足够,不需要分布式
+- **数据合成**:用一个较大的 teacher 模型(Gemma 4 / Llama 3.1 70B / Qwen 2.5 72B
+  量化版等)批量生成训练或偏好数据
+- **临时推理**:App 还没上生产,又想在云上跑模型做评测、demo、写 prompt
+- **单 GPU 够用**的任何 Ollama 工作流,时间从几小时到几天
 
-## 不适用场景
-
-- 高并发生产服务(Ollama 没有 continuous batching,应改用 vLLM)
-- 模型训练(用主项目的 training-env)
-- 长期持续运行(此时 Bedrock on-demand API 通常更便宜)
+不适用:
+- 生产级高并发(Ollama 没有 continuous batching,建议 vLLM / SGLang)
+- 模型训练(微调用专门的训练环境)
+- 长期 7×24(这时候 Bedrock / 托管 API 往往更便宜)
 
 ## 架构
 
 ```
 MacBook  ──SSM port-fwd:11434──>  EC2 g5.xlarge (默认 VPC 内)
-                                     └─ Ollama + gemma4:26b (Q4_K_M)
+                                     └─ Ollama + <your model>
                                      └─ 127.0.0.1:11434 (不对公网)
                                      └─ IAM: SSM + S3 写
-结果 JSONL  ──────────────────────>  S3 artifact bucket
+artifacts ───────────────────────>  S3 bucket
 ```
 
 - 默认 VPC、第一个兼容 AZ 的子网
 - 零 inbound 的 Security Group,出口仅放行 443 / 80 / 53 / 123
 - 根卷 100 GB gp3、加密、IMDSv2 required
-- 空闲 1 小时自动关机(避免跑完没人关机)
+- 空闲 1 小时自动关机
 
 ## 前置
 
 ```bash
-# AWS CLI v2 + Session Manager plugin
 brew install awscli
 brew install --cask session-manager-plugin
 
-# 确认账号和默认 region
 aws sts get-caller-identity
 aws configure get region
 ```
 
 ## 用法
 
+### 默认:Gemma 4 26B(已 smoke-tested)
+
 ```bash
-# 1) 部署(默认 us-east-1、g5.xlarge On-Demand)
+./scripts/deploy.sh                       # us-east-1、g5.xlarge、gemma4:26b
+USE_SPOT=true ./scripts/deploy.sh         # Spot 省 ~60%
+```
+
+### 换模型
+
+```bash
+OLLAMA_MODEL=llama3.1:8b ./scripts/deploy.sh
+
+# 大模型需要更大 GPU
+INSTANCE_TYPE=g6e.xlarge \
+OLLAMA_MODEL=llama3.1:70b-instruct-q4_K_M \
+ROOT_VOLUME_GB=200 \
 ./scripts/deploy.sh
-
-# Spot(省 ~60%,合成任务推荐)
-USE_SPOT=true ./scripts/deploy.sh
-
-# 换 region / 机型
-AWS_REGION=us-west-2 INSTANCE_TYPE=g6e.xlarge ./scripts/deploy.sh
 ```
 
-UserData 会自动完成:装 Ollama → `ollama pull gemma4:26b` → 预热一次,整体 8–12 分钟。
-看进度:
+`OLLAMA_MODEL` 可以是 [ollama.com/library](https://ollama.com/library) 任何 tag。
+配对 GPU 时按 "**模型磁盘大小 × 1.1 ≈ VRAM 需求**" 估一下,留 2GB 给 KV cache:
+
+| 模型体积 | 合适机型 |
+|---|---|
+| ≤ 9GB | g5.xlarge / g6.xlarge(24GB) |
+| 9–20GB | g5.xlarge / g6.xlarge(24GB),单流;推荐 g5.2xlarge 留多点 CPU |
+| 20–40GB | g6e.xlarge(48GB L40S) |
+| 40–70GB | 需要量化版,或 `g5.12xlarge`/`g6e.12xlarge` 多卡(本模板未适配多卡) |
+
+### 部署后
 
 ```bash
-./scripts/status.sh
+./scripts/status.sh                       # 轮询到 ollama-ready 出现(8–12 分钟)
+./scripts/tunnel.sh                       # 开 SSM 端口转发 11434
+curl http://localhost:11434/api/tags      # 从 Mac 端验证
 ```
 
-模型就绪后,本地起 SSM 转发:
-
-```bash
-./scripts/tunnel.sh
-# 本地 curl http://localhost:11434/api/tags 能看到 gemma4:26b
-```
-
-合成脚本里用 OpenAI-兼容 client:
+合成/推理脚本用 OpenAI 兼容 client,或者 Ollama 原生 API:
 
 ```python
+# 普通模型
 from openai import OpenAI
 client = OpenAI(base_url="http://localhost:11434/v1", api_key="ollama")
 resp = client.chat.completions.create(
-    model="gemma4:26b",
-    messages=[{"role": "system", "content": "..."},
-              {"role": "user", "content": "..."}],
-    temperature=1.0, top_p=0.95,
-    # Gemma 4 defaults to thinking mode, which dumps reasoning tokens
-    # instead of the answer. OpenAI endpoint does not expose `think`, so
-    # use Ollama's /api/chat directly (see below) or set a system prompt
-    # that discourages reasoning.
+    model="gemma4:26b",                   # 或任何已 pull 的 tag
+    messages=[...],
+    temperature=0.8,
 )
-```
 
-**Gemma 4 thinking mode 必须显式关闭**——默认开启时,模型会把几百 token 的思考链写进
-`message.reasoning` 字段,`content` 可能为空。合成数据要的是直接回答,用 Ollama 原生 API:
-
-```python
+# 对于带 thinking/reasoning 模式的模型(Gemma 4、DeepSeek-R1 等),
+# 合成数据时需要关闭 reasoning,OpenAI endpoint 不透传这个参数,
+# 改用 Ollama 原生 API:
 import requests
 r = requests.post("http://localhost:11434/api/chat", json={
     "model": "gemma4:26b",
-    "messages": [{"role": "user", "content": "..."}],
-    "think": False,                              # 关键
+    "messages": [...],
+    "think": False,                       # Gemma 4 必须关,否则 content 为空
     "stream": False,
-    "options": {"temperature": 1.0, "top_p": 0.95, "num_predict": 512},
+    "options": {"temperature": 0.8, "num_predict": 512},
 })
 print(r.json()["message"]["content"])
 ```
 
-合成结果传 S3:
+### 销毁
 
 ```bash
-aws s3 cp data/synth/sft_v1.jsonl s3://$ARTIFACT_BUCKET/synth/
+./scripts/destroy.sh                      # EC2、SG、IAM 都删;S3 桶是 Retain,需要的话手动删
 ```
 
-用完一定销毁:
+## 机型参考(us-east-1 价格)
 
-```bash
-./scripts/destroy.sh
-```
-
-## 机型推荐
-
-| 机型 | GPU | VRAM | Spot 估价 | 适用 |
-|---|---|---|---|---|
-| `g5.xlarge`(默认) | A10G | 24 GB | ~$0.35–0.50/h | 够用,性价比最高 |
-| `g6.xlarge` | L4 | 24 GB | ~$0.30–0.45/h | 更便宜,decode 略慢 |
-| `g6e.xlarge` | L40S | 48 GB | ~$0.70–1.00/h | 想跑 BF16 / FP8、吞吐翻倍 |
-
-Gemma 4 26B-A4B Q4_K_M 约 17 GB VRAM,24 GB 够带 32K context 和
-`OLLAMA_NUM_PARALLEL=4`。
-
-## 成本估算
-
-A10G Spot + Ollama `NUM_PARALLEL=4` 聚合约 80–120 tok/s。
-
-- 1 千条种子多轮对话 ≈ 1.5M 输出 token ≈ 3.5–5 小时 ≈ **$1.5–2.5**
-- 1 万条 ≈ 15M 输出 token ≈ 35–50 小时 ≈ **$15–25**
-
-EBS 卷 100 GB gp3 $0.008/h,可忽略。
+| 机型 | GPU | VRAM | On-Demand | Spot | 适用 |
+|---|---|---|---|---|---|
+| `g5.xlarge`(默认) | A10G | 24 GB | ~$1.0/h | ~$0.35–0.50/h | 7B–26B 量化 |
+| `g5.2xlarge` | A10G | 24 GB | ~$1.2/h | ~$0.40–0.55/h | 同上,多 CPU 对数据处理更舒服 |
+| `g6.xlarge` | L4 | 24 GB | ~$0.8/h | ~$0.30–0.45/h | 同档,L4 比 A10G 略慢一点 |
+| `g6e.xlarge` | L40S | 48 GB | ~$1.9/h | ~$0.70–1.00/h | 30B 满精度 / 70B 量化 / FP8 |
 
 ## 安全基线
 
-- **零 inbound**:Security Group 不开任何入站端口;访问必须经 SSM
-- **Ollama bind 127.0.0.1**:即使有人闯进子网也打不到 API
-- **IMDSv2 required**,`HttpPutResponseHopLimit: 2`(容器兼容)
-- **EBS 加密**,S3 bucket 强制 TLS、全部 block public
-- **IAM** 最小权限:SSM core + 写 artifact bucket;无 `ec2:*`、无 `iam:*`
+- 零 inbound SG
+- `OLLAMA_HOST=127.0.0.1:11434`,即使 VPC 内其他主机也打不到
+- IMDSv2 required,`HttpPutResponseHopLimit: 2`
+- EBS 加密,S3 强制 TLS + block public
+- IAM 最小权限:SSM core + 单 bucket 读写;无 `ec2:*`、无 `iam:*`
 
-## 销毁注意
+## 成本快算
 
-- `./scripts/destroy.sh` 走 `cloudformation delete-stack`
-- **artifact bucket 是 Retain**,不会被 stack 删除(合成结果宝贵);想彻底删自己
-  `aws s3 rb --force`
-- EBS 卷随 EC2 一并销毁
+A10G Spot 单流 ~60–100 tok/s、`NUM_PARALLEL=4` 聚合 80–120 tok/s:
+
+- 1 千条多轮对话 ≈ 1.5M 输出 tok ≈ 3.5–5h ≈ **$1.5–2.5**
+- 1 万条 ≈ 15M 输出 tok ≈ 35–50h ≈ **$15–25**
+
+EBS 100 GB gp3 $0.008/h,可忽略。
 
 ## 文件
 
 ```
-gemma-synth-host/
-├── README.md                      # 本文件
+ollama-host/                              # 文件夹目前叫 gemma-synth-host/(历史)
+├── README.md                             # 本文件
 ├── cloudformation/
-│   └── ollama-host.yaml           # 单文件 stack
+│   └── ollama-host.yaml
+├── docs/
+│   └── smoke-test-notes.md               # smoke test 的发现和修复记录
 └── scripts/
-    ├── deploy.sh                  # 创建 / 更新
-    ├── destroy.sh                 # 销毁
-    ├── tunnel.sh                  # SSM 端口转发 11434
-    ├── ssm-shell.sh               # SSM 交互式 shell
-    └── status.sh                  # 查看 bootstrap 进度 / 模型就绪状态
+    ├── deploy.sh / destroy.sh
+    ├── tunnel.sh / ssm-shell.sh
+    └── status.sh
 ```
+
+## 注意事项
+
+- **首次 deploy 后要清 S3 桶才能 re-deploy**:桶是 `DeletionPolicy: Retain`,
+  stack 删了它不删;再次 `deploy.sh` 前手动 `aws s3 rb s3://<name> --force`。
+  `destroy.sh` 会提示桶名。
+- **Thinking-mode 模型默认有大量 reasoning token**:合成场景用 `/api/chat` +
+  `think:false`。详见 [docs/smoke-test-notes.md](./docs/smoke-test-notes.md) 第 4 节。
+- **Ollama pull 在非 TTY 可能卡在 verify**:UserData 已做 timeout+retry 兜底,
+  血泪史见 smoke-test-notes 第 3 节。

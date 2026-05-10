@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-STACK_NAME="${STACK_NAME:-gemma-synth-dev}"
+STACK_NAME="${STACK_NAME:-ollama-host-dev}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 
 # shellcheck disable=SC2016  # JMESPath literal; intentionally not shell-expanded
@@ -49,7 +49,7 @@ CMD_ID="$(aws ssm send-command \
   --instance-ids "$INSTANCE_ID" \
   --region "$AWS_REGION" \
   --document-name 'AWS-RunShellScript' \
-  --comment 'gemma-synth status check' \
+  --comment 'ollama-host status check' \
   --parameters 'commands=[
     "echo --- markers ---",
     "ls -l /var/lib/cloud/instance/ollama-ready 2>/dev/null || echo ollama-ready: not yet",
