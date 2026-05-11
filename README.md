@@ -225,5 +225,17 @@ EBS 100 GB gp3 约 $0.008/h,可忽略。
 
 ---
 
+## 🔗 相关项目
+
+- **下游消费者**:[`emotion-llm-lab`](https://github.com/ericyanpek/emotion-llm-lab) —
+  消费本仓合成的 SFT / DPO 语料,在 Amazon EC2 `g5.2xlarge` 上对 Qwen3-8B 进行
+  QLoRA 4-bit 微调(SFT 人设注入 → DPO 情感对齐),面向全球化情感陪伴 App 场景。
+  两仓通过同账号的 Amazon S3 artifact bucket 家族联动——本仓产出训练语料并持久化
+  到 S3,下游仓库通过 IAM scoped 权限读取同一 bucket,训练完成后回写 LoRA adapter。
+  合成集群与训练集群生命周期独立:Ollama 任务短时按需启停,训练栈长期保留 EBS 快速
+  恢复。
+
+---
+
 > 仓库目录名沿用 `gemma-synth-host/`,保留 git 历史的同时,stack、project、
 > CloudWatch namespace 等内部命名已通用化为 `ollama-host`。
